@@ -66,6 +66,15 @@ framework:
     decoder_intermediate: 3420
     use_high_res_proj:    false
 
+    # ---- v3: VRT tokens out of model vocab (Phase 7) --------------------------
+    # Matches original PaDT (padt.py:194,296). Tokenizer still recognizes VRT
+    # strings so build_padt_inputs is unchanged; but model's embed_tokens /
+    # lm_head are NOT extended for 256 VRT rows. VRT IDs are looked up via
+    # _replace_vrt_embeddings (prototype injection) on input, and logits are
+    # produced via cat path (compute_dynamic_logits). Saves ~2 MB of vestigial
+    # weights and aligns the lm_head matmul cost with original PaDT.
+    vrt_in_vocab: false
+
     # dynamic VRT bank
     num_vrt_tokens: 256
     num_core_vrt_tokens: 5

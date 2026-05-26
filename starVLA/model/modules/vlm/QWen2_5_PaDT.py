@@ -108,6 +108,22 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
     # token setup
     # ---------------------------------------------------------------------
     def _init_padt_tokens(self) -> None:
+        """Register PaDT special tokens with the tokenizer.
+
+        Phase 7 (vocab-external VRT, aligned with original PaDT padt.py:194):
+        - Control + obj + view tokens (~11 of them) ARE added to tokenizer AND
+          resized into embed_tokens / lm_head — they need real learnable rows.
+        - VRT tokens (256 of them) are added to tokenizer (so build_padt_inputs
+          can still produce them via string tokenization) but the model's
+          embed_tokens / lm_head are NOT extended for them — VRT IDs are
+          "virtual" (>= effective_model_vocab_size). Their embeddings are
+          supplied at runtime via _replace_vrt_embeddings, and their logits via
+          compute_dynamic_logits' cat path.
+
+        Backward compatible: if `padt.vrt_in_vocab` is True (legacy v2 path,
+        default), VRT tokens are added to tokenizer + model is resized for
+        them (the previous behavior). v3 yaml sets it false.
+        """
         tokenizer = self.processor.tokenizer
         padt_begin = self.padt_cfg.get("padt_begin_token", "<|padt_begin|>")
         padt_end = self.padt_cfg.get("padt_end_token", "<|padt_end|>")
@@ -118,7 +134,10 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         view_tokens = [f"<|view_{view_name}|>" for view_name in self.view_names[: self.num_vrt_views]]
         vrt_tokens = [f"<|padt_vrt_{idx:03d}|>" for idx in range(self.num_vrt_tokens)]
 
-        additional_special_tokens = [
+        self.vrt_in_vocab = bool(self.padt_cfg.get("vrt_in_vocab", True))
+
+        # Stage 1: register control + obj + view (always in real model vocab).
+        control_tokens = [
             padt_begin,
             padt_end,
             reason_begin,
@@ -126,11 +145,28 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             padt_null,
             *obj_tokens,
             *view_tokens,
-            *vrt_tokens,
         ]
-        num_added = tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
-        if num_added > 0:
-            self.model.resize_token_embeddings(len(tokenizer))
+        if self.vrt_in_vocab:
+            # Legacy v2 path: add everything in one shot, resize once.
+            num_added = tokenizer.add_special_tokens(
+                {"additional_special_tokens": control_tokens + vrt_tokens}
+            )
+            if num_added > 0:
+                self.model.resize_token_embeddings(len(tokenizer))
+        else:
+            # v3 path: control tokens first, resize, THEN VRT (no resize).
+            num_added_control = tokenizer.add_special_tokens(
+                {"additional_special_tokens": control_tokens}
+            )
+            if num_added_control > 0:
+                self.model.resize_token_embeddings(len(tokenizer))
+            # Capture the boundary BEFORE adding VRT — this is the "real"
+            # model vocab size; VRT IDs assigned next will be virtual.
+            self._effective_model_vocab_size = len(tokenizer)
+            tokenizer.add_special_tokens(
+                {"additional_special_tokens": vrt_tokens}
+            )
+            # NOTE: deliberately NOT calling resize_token_embeddings again.
 
         self.token_table = {
             "padt_begin": padt_begin,
@@ -156,6 +192,14 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         self.vrt_end_id = self.vrt_start_id + self.num_vrt_tokens
         self.obj_token_ids = list(self.token_ids["obj_tokens"])
         self.view_token_ids = list(self.token_ids["view_tokens"])
+
+        # Phase 7: track the "effective model vocab" boundary. For v2 (vrt in
+        # vocab), it is the full tokenizer length. For v3 (vocab-external VRT),
+        # it is the vocab BEFORE VRT tokens were appended; any input_id >= this
+        # value is a virtual VRT ID and must NOT be looked up in embed_tokens.
+        if not hasattr(self, "_effective_model_vocab_size"):
+            self._effective_model_vocab_size = len(self.processor.tokenizer)
+        self._padt_null_id = int(self.token_ids["padt_null"])  # safe placeholder for embed lookup
 
     # ---------------------------------------------------------------------
     # prompt / input building
@@ -556,7 +600,20 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
     ) -> torch.Tensor:
         input_ids = qwen_inputs["input_ids"]
         embed_fn = self.model.get_input_embeddings()
-        inputs_embeds = embed_fn(input_ids)
+        # Phase 7: when VRT is out of model vocab, embed_fn(input_ids) would
+        # index out of range at VRT positions. Mask those IDs to a safe in-vocab
+        # token (padt_null) before lookup; _replace_vrt_embeddings below then
+        # overwrites those positions with prototype values, so the placeholder
+        # never reaches the LLM. Legacy v2 path (vrt_in_vocab=True) is a no-op.
+        if not getattr(self, "vrt_in_vocab", True):
+            safe_input_ids = torch.where(
+                input_ids >= self._effective_model_vocab_size,
+                torch.full_like(input_ids, self._padt_null_id),
+                input_ids,
+            )
+            inputs_embeds = embed_fn(safe_input_ids)
+        else:
+            inputs_embeds = embed_fn(input_ids)
         inputs_embeds = self._replace_image_embeddings(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -580,22 +637,31 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         *,
         view_idx: int = 0,
     ) -> torch.Tensor:
-        """Overwrite the VRT-range columns of `static_logits` with dynamic
-        prototype-based logits, in place.
+        """Produce logits over the (extended) vocabulary including VRT columns.
 
-        Phase 0 audit confirmed `outputs.logits` is only ever consumed here
-        (QWen2_5_PaDT.py:728, :928), so in-place mutation is safe and saves
-        the ~100 MB/step clone of the full [B, T, vocab≈152k] tensor in the
-        autograd graph.
+        v2 path (vrt_in_vocab=True): VRT IDs are inside model vocab, so
+        static_logits already has columns for them — we just overwrite that
+        range in-place with prototype-based logits. (Phase 2 saved the clone.)
+
+        v3 path (vrt_in_vocab=False): VRT IDs are virtual, beyond model vocab.
+        static_logits ends at the real model vocab; we concatenate the dynamic
+        VRT logits onto the right. This matches original PaDT (padt.py:296:
+        `lm_weight = cat([self.lm_head.weight, image_prototypes], dim=0)`).
         """
         P_view = self._select_p_ref(P_ref, view_idx)
         if hidden.dim() == 2:
             dynamic_vrt_logits = torch.einsum("bd,bnd->bn", hidden, P_view)
+        else:
+            dynamic_vrt_logits = torch.einsum("bld,bnd->bln", hidden, P_view)
+
+        if getattr(self, "vrt_in_vocab", True):
+            # In-place overwrite of the existing VRT range; saves the clone.
             static_logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
             return static_logits
-        dynamic_vrt_logits = torch.einsum("bld,bnd->bln", hidden, P_view)
-        static_logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
-        return static_logits
+        else:
+            # Cat: static_logits is over [0, vrt_start_id). VRT logits append
+            # at indices [vrt_start_id, vrt_end_id).
+            return torch.cat([static_logits, dynamic_vrt_logits], dim=-1)
 
     def _compute_lang_summary(
         self,
@@ -827,7 +893,19 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
     ):
         use_dynamic_embed = ((token_ids >= self.vrt_start_id) & (token_ids < self.vrt_end_id)).any()
         if use_dynamic_embed:
-            inputs_embeds = self.model.get_input_embeddings()(token_ids)
+            # Phase 7: when VRT IDs are virtual (>= effective model vocab),
+            # raw embed lookup would index out of range. Mask them to a safe
+            # in-vocab placeholder before lookup; _replace_vrt_embeddings
+            # overwrites those positions with prototypes immediately after.
+            if not getattr(self, "vrt_in_vocab", True):
+                safe_token_ids = torch.where(
+                    token_ids >= self._effective_model_vocab_size,
+                    torch.full_like(token_ids, self._padt_null_id),
+                    token_ids,
+                )
+                inputs_embeds = self.model.get_input_embeddings()(safe_token_ids)
+            else:
+                inputs_embeds = self.model.get_input_embeddings()(token_ids)
             inputs_embeds = self._replace_vrt_embeddings(token_ids, inputs_embeds, P_ref, default_view_idx=view_idx)
             outputs = self.forward(
                 inputs_embeds=inputs_embeds,
