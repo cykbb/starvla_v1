@@ -79,12 +79,23 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        self.high_res_proj = nn.Sequential(
-            nn.LayerNorm(self.vision_hidden_dim),
-            nn.Linear(self.vision_hidden_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
+        # Phase 6: high_res_proj is optional. In v2 it projects ViT pre-merger
+        # (vision_hidden_dim, typically 1280) up to LLM hidden (2048). In v3 we
+        # set decoder hidden_size = 1280, so high-res features can flow into the
+        # decoder at native ViT dim with no projection — matches original PaDT
+        # (padt.py:101 -> padt_decoder cu_high_res_feats stays at 1280).
+        # When disabled, extract_patch_features returns high_res at
+        # vision_hidden_dim (1280) instead of hidden_dim (2048).
+        self.use_high_res_proj = bool(self.padt_cfg.get("use_high_res_proj", True))
+        if self.use_high_res_proj:
+            self.high_res_proj = nn.Sequential(
+                nn.LayerNorm(self.vision_hidden_dim),
+                nn.Linear(self.vision_hidden_dim, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+        else:
+            self.high_res_proj = None
         self.lang_summary_proj = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -369,12 +380,22 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             per_image_features.append(self._normalize_visual_token_count(image_embeds[cursor : cursor + count_int]))
             cursor += count_int
         cursor = 0
-        high_proj_param = next(self.high_res_proj.parameters())
+        # Phase 6: when high_res_proj is disabled (v3 config), high_res tokens
+        # stay at vision_hidden_dim (1280, ViT pre-merger), matching original
+        # PaDT. Decoder is expected to consume them at that dim directly.
+        high_res_target_dim = self.hidden_dim if self.use_high_res_proj else self.vision_hidden_dim
+        if self.use_high_res_proj:
+            high_proj_param = next(self.high_res_proj.parameters())
         for count in per_image_high_counts:
             count_int = int(count)
             high_res = high_res_embeds[cursor : cursor + count_int]
-            high_res = self.high_res_proj(high_res.to(device=high_proj_param.device, dtype=high_proj_param.dtype))
-            high_res = high_res.to(device=image_embeds.device, dtype=image_embeds.dtype)
+            if self.use_high_res_proj:
+                high_res = self.high_res_proj(high_res.to(device=high_proj_param.device, dtype=high_proj_param.dtype))
+                high_res = high_res.to(device=image_embeds.device, dtype=image_embeds.dtype)
+            else:
+                # Keep ViT pre-merger features at vision_hidden_dim, but move
+                # to same device/dtype as image_embeds for downstream stacking.
+                high_res = high_res.to(device=image_embeds.device, dtype=image_embeds.dtype)
             per_image_high_features.append(self._normalize_token_count(high_res, self.high_res_tokens_per_view))
             cursor += count_int
 
@@ -385,7 +406,7 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             device=image_embeds.device,
         )
         zero_high_view = torch.zeros(
-            (self.high_res_tokens_per_view, self.hidden_dim),
+            (self.high_res_tokens_per_view, high_res_target_dim),
             dtype=image_embeds.dtype,
             device=image_embeds.device,
         )

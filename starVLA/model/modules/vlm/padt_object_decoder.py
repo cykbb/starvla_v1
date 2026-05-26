@@ -86,9 +86,20 @@ class PaDTDecoderOutput:
 class _PaDTStyleBlock(nn.Module):
     """PaDT-style query/image block scoped to one object in one view."""
 
-    def __init__(self, hidden_dim: int, num_heads: int = 8, mlp_ratio: int = 4, update_memory: bool = True):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        mlp_ratio: int = 4,
+        update_memory: bool = True,
+        intermediate_size: Optional[int] = None,
+    ):
         super().__init__()
         self.update_memory = update_memory
+        # If `intermediate_size` is given explicitly (Phase 6 / original PaDT
+        # uses 3420 for 1280 hidden, i.e. 2.67x), use it; otherwise fall back
+        # to mlp_ratio * hidden_dim (legacy 2048-decoder behavior used 4x).
+        inter = int(intermediate_size) if intermediate_size is not None else hidden_dim * mlp_ratio
         self.query_self_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.query_to_image = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.image_to_query = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True) if update_memory else None
@@ -98,9 +109,9 @@ class _PaDTStyleBlock(nn.Module):
         self.m_norm1 = nn.LayerNorm(hidden_dim)
         self.m_norm2 = nn.LayerNorm(hidden_dim) if update_memory else None
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
+            nn.Linear(hidden_dim, inter),
             nn.GELU(),
-            nn.Linear(hidden_dim * mlp_ratio, hidden_dim),
+            nn.Linear(inter, hidden_dim),
         )
 
     def forward(self, query: torch.Tensor, memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -131,11 +142,22 @@ class PaDTObjectDecoder(nn.Module):
     def __init__(self, config: Any):
         super().__init__()
         padt_cfg = config.framework.get("padt", {})
-        hidden_dim = int(config.framework.qwenvl.vl_hidden_dim)
-        self.hidden_dim = hidden_dim
+        llm_hidden_dim = int(config.framework.qwenvl.vl_hidden_dim)
+        # Phase 6: decoder hidden_size is now configurable independently of the
+        # LLM hidden. Defaults to llm_hidden_dim for backward compatibility with
+        # v2 checkpoints. The v3 config sets this to 1280 (ViT hidden) to align
+        # with the original PaDT decoder design (padt_sft_trainer.py:151-160).
+        decoder_hidden_dim = int(padt_cfg.get("decoder_hidden_size", llm_hidden_dim))
+        decoder_intermediate = padt_cfg.get("decoder_intermediate", None)  # original PaDT: 3420
+        self.llm_hidden_dim = llm_hidden_dim
+        self.hidden_dim = decoder_hidden_dim  # decoder-internal working dim
+        self.needs_input_projection = decoder_hidden_dim != llm_hidden_dim
+
         self.num_views = int(padt_cfg.get("decoder_num_views", 2))
         self.num_patch_tokens_per_view = int(padt_cfg.get("num_vrt_tokens", 256))
         self.num_core_tokens = int(padt_cfg.get("num_core_vrt_tokens", 5))
+        # Original PaDT 3B uses num_heads=16 with hidden=1280 (=> head_dim 80).
+        # Default 8 is preserved for backward compatibility with v2 (2048/8 = 256).
         self.num_heads = int(padt_cfg.get("decoder_num_heads", 8))
         self.spatial_merge_size = int(padt_cfg.get("spatial_merge_size", 2))
         self.high_res_tokens_per_view = int(
@@ -150,15 +172,41 @@ class PaDTObjectDecoder(nn.Module):
         # self.training=False so the wrapping is a no-op there.
         self._use_grad_ckpt = False
 
+        # Phase 6: input projection from LLM space (2048) down to decoder space
+        # (1280). Used for both queries (LLM hidden at VRT positions, fed by
+        # caller) and low-res patch memory (visual.merger output, also 2048).
+        # High-res memory comes in already at decoder_hidden_dim (ViT pre-merger
+        # 1280) so does NOT go through this projection — see forward().
+        # When decoder_hidden_dim == llm_hidden_dim (legacy v2 path), this is an
+        # identity-like nn.Identity so no extra params or compute.
+        if self.needs_input_projection:
+            self.input_projection = nn.Sequential(
+                nn.LayerNorm(llm_hidden_dim),
+                nn.Linear(llm_hidden_dim, decoder_hidden_dim),
+                nn.GELU(),
+                nn.Linear(decoder_hidden_dim, decoder_hidden_dim),
+            )
+        else:
+            self.input_projection = nn.Identity()
+
+        # All decoder-internal modules now use decoder_hidden_dim (= hidden_dim).
+        hidden_dim = decoder_hidden_dim
+
         self.view_embedding = nn.Embedding(self.num_views, hidden_dim)
         self.vrt_embedding = nn.Embedding(1, hidden_dim)
         self.task_tokens = nn.Embedding(3, hidden_dim)  # bbox, score, mask
         self.low_xy_embedding = nn.Linear(2, hidden_dim)
         self.high_xy_embedding = nn.Linear(2, hidden_dim)
 
-        self.low_res_block = _PaDTStyleBlock(hidden_dim, self.num_heads, update_memory=True)
-        self.high_res_block1 = _PaDTStyleBlock(hidden_dim, self.num_heads, update_memory=True)
-        self.high_res_block2 = _PaDTStyleBlock(hidden_dim, self.num_heads, update_memory=True)
+        self.low_res_block = _PaDTStyleBlock(
+            hidden_dim, self.num_heads, update_memory=True, intermediate_size=decoder_intermediate,
+        )
+        self.high_res_block1 = _PaDTStyleBlock(
+            hidden_dim, self.num_heads, update_memory=True, intermediate_size=decoder_intermediate,
+        )
+        self.high_res_block2 = _PaDTStyleBlock(
+            hidden_dim, self.num_heads, update_memory=True, intermediate_size=decoder_intermediate,
+        )
         self.high_res_norm = nn.LayerNorm(hidden_dim)
 
         self.bbox_head = nn.Sequential(
@@ -188,11 +236,14 @@ class PaDTObjectDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim // 16),
         )
+        # Phase 6: object_memory output goes to action head via condition_bridge.
+        # Bridge expects llm_hidden_dim (2048). When decoder is at 1280, the
+        # final Linear here projects back up.
         self.object_memory_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, llm_hidden_dim),
         )
 
     def _add_patch_context(self, features: torch.Tensor, per_view_tokens: int, xy_embedding: nn.Linear) -> torch.Tensor:
@@ -331,6 +382,17 @@ class PaDTObjectDecoder(nn.Module):
         target_visible_by_view: Optional[torch.Tensor] = None,
         object_presence_mask: Optional[torch.Tensor] = None,
     ) -> PaDTDecoderOutput:
+        # Phase 6: project LLM-space inputs (queries from LLM hidden, low-res
+        # patches from visual.merger output — both 2048-d) down to decoder
+        # working dim (1280-d). When decoder_hidden_dim == llm_hidden_dim
+        # (legacy v2 behavior), input_projection is nn.Identity().
+        # High-res patches are expected to already be at decoder_hidden_dim
+        # (ViT pre-merger 1280-d, fed in from extract_patch_features with the
+        # high_res_proj path disabled in v3 config).
+        if self.needs_input_projection:
+            vrt_token_sequences = self.input_projection(vrt_token_sequences)
+            low_res_features = self.input_projection(low_res_features)
+
         if high_res_features is None:
             repeat = self.high_res_tokens_per_view // self.num_patch_tokens_per_view
             high_res_features = low_res_features.view(
