@@ -1,0 +1,2 @@
+{"task_index": 0, "task": "<copy from meta/tasks.parquet>", "objects": ["chefmate 8 frypan", "moka pot", "flat stove"], "task_objects": ["moka pot", "flat stove"], "object_role": {"moka pot": "primary", "flat stove": "secondary"}}
+{"task_index": 1, "task": "<copy from meta/tasks.parquet>", "objects": [], "task_objects": [], "object_role": {}}

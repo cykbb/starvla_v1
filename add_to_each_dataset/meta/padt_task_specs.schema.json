@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PaDT task-level metadata sidecar",
+  "type": "object",
+  "required": ["task_index", "task", "task_objects", "object_role"],
+  "properties": {
+    "task_index": {
+      "type": "integer",
+      "description": "Must match meta/tasks.parquet::task_index"
+    },
+    "task": {
+      "type": "string",
+      "description": "Task text copied from meta/tasks.parquet"
+    },
+    "objects": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Scene-level object labels stored once per task. Labels should match segmentation label strings exactly."
+    },
+    "task_objects": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Ordered task-relevant subset used by QwenPaDTPI structured slots. Names must match segmentation labels exactly."
+    },
+    "object_role": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "Role map such as primary / secondary / receptacle / tool. Keys must be task_objects labels."
+    }
+  },
+  "additionalProperties": true
+}

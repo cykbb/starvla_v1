@@ -1,0 +1,150 @@
+run_id: qwen_padtpi_libero_dualvrt_v2
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_PaDTPI
+is_debug: false
+
+framework:
+  name: QwenPaDTPI
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
+    attn_implementation: flash_attention_2
+    interface_variant: padt
+    vl_hidden_dim: 2048
+    num_vl_layers: 16
+
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 7
+    action_horizon: 8
+    past_action_window_size: 0
+    repeated_diffusion_steps: 1
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+  padt:
+    # Dual-view PaDT path: each object predicts fixed VRT slots for agentview and wrist.
+    use_noisy_teacher_branch: true
+    use_sampled_branch: false
+    debug_vrt_alignment: true
+    debug_vrt_metrics: true
+
+
+    # dynamic VRT bank
+    num_vrt_tokens: 256
+    num_core_vrt_tokens: 5
+    max_task_objects: 4
+    view_names: [agentview, wrist]
+    decoder_num_views: 2
+    spatial_merge_size: 2
+    high_res_tokens_per_view: 1024
+    decoder_num_heads: 8
+
+    # Action conditioning tokens: lang + object memory + object-view memory.
+    bridge_max_object_tokens: 4
+    bridge_max_view_tokens: 8
+    bridge_max_condition_tokens: 16
+
+    # teacher strategy knobs
+    # Warmup example: noisy_teacher_probability=0.0
+    # Joint-1 example: noisy_teacher_probability=0.15
+    noisy_teacher_probability: 0.0
+    sampled_branch_weight: 0.0
+
+    role_vocab:
+      [slot_1, slot_2, slot_3, slot_4, primary, secondary, receptacle, tool]
+
+    loss_weights:
+      act: 1.0
+      vrt: 0.1
+      bbox: 0.25
+      mask: 0.25
+      score: 0.1
+
+  reduce_in_full_precision: true
+
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_all
+    action_type: delta_qpos
+    sequential_step_sampling: False
+    include_state: true
+    default_image_resolution: [3, 448, 448]
+    image_size: [448, 448]
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    obs: [image_0, image_1]
+    video_backend: torchvision_av
+
+    # Preferred PaDT source for LeRobot v3 LIBERO:
+    # task-level metadata lives once under meta/, and step-level segmentation
+    # stays in parquet columns.
+    padt_use_segmentation_source: true
+    padt_task_meta_filename: meta/padt_task_specs.jsonl
+    padt_task_meta_required: true
+    padt_segmentation_fields:
+      agentview: segmentation.agentview_bbox_mask
+      wrist: segmentation.wrist_bbox_mask
+    padt_patch_grid_size: 16
+    padt_valid_patch_threshold: 0.30
+    padt_num_core_patches: 5
+    padt_agentview_name: agentview
+
+trainer:
+  epochs: 100
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    padt_decoder: 5.0e-05
+    condition_bridge: 5.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: true
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
