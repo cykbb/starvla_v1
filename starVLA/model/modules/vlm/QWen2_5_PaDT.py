@@ -426,6 +426,12 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             "high_res_wrist": high_wrist,
             "high_res_all": high_all_views,
             "vrt_bank": vrt_bank,
+            # Raw merged visual tokens — exactly what `self.model.visual(...)` would
+            # return in `_replace_image_embeddings`. Cached here so downstream
+            # `forward_dynamic` / `custom_vrt_decode` can pass it back via
+            # `precomputed_image_embeds` and avoid re-running the ViT. Equivalent to
+            # original PaDT's `past_image_embeds` mechanism (padt.py:222).
+            "_raw_visual_tokens": image_embeds,
         }
 
     def build_prototypes(self, patch_features: torch.Tensor) -> torch.Tensor:
@@ -441,18 +447,29 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         *,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Replace <image> placeholder embeddings with visual-tower outputs.
+
+        If `precomputed_image_embeds` is provided (shape `[total_visual_tokens, hidden]`,
+        produced by an upstream `_visual_forward_dual_res` / `extract_patch_features`
+        call), reuse it instead of running the ViT again. This is the in-step
+        equivalent of original PaDT's `past_image_embeds` caching (padt.py:222).
+        """
         if pixel_values is None or image_grid_thw is None:
             return inputs_embeds
 
-        visual_dtype = getattr(self.model.visual, "dtype", None)
-        if visual_dtype is None:
-            try:
-                visual_dtype = next(self.model.visual.parameters()).dtype
-            except StopIteration:
-                visual_dtype = pixel_values.dtype
+        if precomputed_image_embeds is not None:
+            image_embeds = precomputed_image_embeds
+        else:
+            visual_dtype = getattr(self.model.visual, "dtype", None)
+            if visual_dtype is None:
+                try:
+                    visual_dtype = next(self.model.visual.parameters()).dtype
+                except StopIteration:
+                    visual_dtype = pixel_values.dtype
+            image_embeds = self.model.visual(pixel_values.type(visual_dtype), grid_thw=image_grid_thw)
 
-        image_embeds = self.model.visual(pixel_values.type(visual_dtype), grid_thw=image_grid_thw)
         image_mask = (input_ids == self.model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         n_image_tokens = int((input_ids == self.model.config.image_token_id).sum().item())
         if n_image_tokens != int(image_embeds.shape[0]):
@@ -514,6 +531,7 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         P_ref: torch.Tensor,
         *,
         default_view_idx: int = 0,
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         input_ids = qwen_inputs["input_ids"]
         embed_fn = self.model.get_input_embeddings()
@@ -523,6 +541,7 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             inputs_embeds=inputs_embeds,
             pixel_values=qwen_inputs.get("pixel_values", None),
             image_grid_thw=qwen_inputs.get("image_grid_thw", None),
+            precomputed_image_embeds=precomputed_image_embeds,
         )
         inputs_embeds = self._replace_vrt_embeddings(
             input_ids=input_ids,
@@ -540,15 +559,22 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         *,
         view_idx: int = 0,
     ) -> torch.Tensor:
+        """Overwrite the VRT-range columns of `static_logits` with dynamic
+        prototype-based logits, in place.
+
+        Phase 0 audit confirmed `outputs.logits` is only ever consumed here
+        (QWen2_5_PaDT.py:728, :928), so in-place mutation is safe and saves
+        the ~100 MB/step clone of the full [B, T, vocab≈152k] tensor in the
+        autograd graph.
+        """
         P_view = self._select_p_ref(P_ref, view_idx)
-        logits = static_logits.clone()
         if hidden.dim() == 2:
             dynamic_vrt_logits = torch.einsum("bd,bnd->bn", hidden, P_view)
-            logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
-            return logits
+            static_logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
+            return static_logits
         dynamic_vrt_logits = torch.einsum("bld,bnd->bln", hidden, P_view)
-        logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
-        return logits
+        static_logits[..., self.vrt_start_id : self.vrt_end_id] = dynamic_vrt_logits
+        return static_logits
 
     def _compute_lang_summary(
         self,
@@ -706,6 +732,7 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         P_ref: torch.Tensor,
         teacher_core_patch_ids: torch.Tensor,
         valid_patch_mask_per_token: torch.Tensor,
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
     ) -> DynamicForwardOutput:
         qwen_inputs = self.build_padt_inputs(
             images=images,
@@ -713,7 +740,11 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             object_roles=object_roles,
             solutions=solutions,
         )
-        inputs_embeds = self.build_inputs_embeds(qwen_inputs=qwen_inputs, P_ref=P_ref)
+        inputs_embeds = self.build_inputs_embeds(
+            qwen_inputs=qwen_inputs,
+            P_ref=P_ref,
+            precomputed_image_embeds=precomputed_image_embeds,
+        )
         outputs = self.forward(
             inputs_embeds=inputs_embeds,
             attention_mask=qwen_inputs["attention_mask"],
@@ -804,6 +835,7 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
         object_roles: List[List[str]],
         object_presence_mask: torch.Tensor,
         P_ref: torch.Tensor,
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
     ) -> DynamicDecodeOutput:
         """Custom cached decode.
 
@@ -817,7 +849,11 @@ class _QWen_PaDT_VL_Interface(_QWen_VL_Interface):
             object_roles=object_roles,
             solutions=None,
         )
-        prompt_inputs_embeds = self.build_inputs_embeds(qwen_inputs=prompt_inputs, P_ref=P_ref)
+        prompt_inputs_embeds = self.build_inputs_embeds(
+            qwen_inputs=prompt_inputs,
+            P_ref=P_ref,
+            precomputed_image_embeds=precomputed_image_embeds,
+        )
         prompt_outputs = self.forward(
             inputs_embeds=prompt_inputs_embeds,
             attention_mask=prompt_inputs["attention_mask"],

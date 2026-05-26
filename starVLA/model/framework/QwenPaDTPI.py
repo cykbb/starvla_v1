@@ -80,6 +80,44 @@ class QwenPaDTPI(baseframework):
         self.role_to_idx = {name: idx for idx, name in enumerate(role_names)}
         self.role_embedding = nn.Embedding(len(self.role_to_idx) + 1, self.config.framework.qwenvl.vl_hidden_dim)
 
+        # Phase 3: honor trainer.enable_gradient_checkpointing flag. Without this
+        # the LLM and ViT run with no activation recomputation, which is the main
+        # reason PaDTPI's effective batch size is far below QwenPI's. Aligns with
+        # the original PaDT trainer (padt_sft_trainer.py:217-236).
+        self._maybe_enable_gradient_checkpointing()
+
+    def _maybe_enable_gradient_checkpointing(self) -> None:
+        trainer_cfg = getattr(self.config, "trainer", None)
+        if trainer_cfg is None:
+            return
+        if not bool(getattr(trainer_cfg, "enable_gradient_checkpointing", False)):
+            return
+        # GC and KV cache are mutually exclusive; checkpoint requires no_cache.
+        # Inference paths run under @torch.inference_mode() with model.training=False,
+        # so this does not affect eval speed.
+        try:
+            self.qwen_vl_interface.model.config.use_cache = False
+            self.qwen_vl_interface.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+            # Qwen2.5-VL's visual tower needs the GC flag set separately.
+            if hasattr(self.qwen_vl_interface.model, "visual"):
+                self.qwen_vl_interface.model.visual.gradient_checkpointing = True
+            # Phase 4: same flag also enables PaDT object decoder checkpointing.
+            # Currently most useful in the 2048-hidden config; after Phase 6
+            # (1280 decoder) this can be turned off via a separate yaml knob if
+            # decoder activation is no longer the bottleneck.
+            if hasattr(self, "padt_decoder"):
+                self.padt_decoder._use_grad_ckpt = True
+        except Exception as e:  # noqa: BLE001
+            # If the underlying HF model does not expose the standard interface,
+            # fall back silently — we'd rather lose checkpointing than crash.
+            import logging
+            logging.getLogger(__name__).warning(
+                "QwenPaDTPI: gradient_checkpointing_enable failed (%s); continuing without GC.",
+                e,
+            )
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
@@ -202,6 +240,8 @@ class QwenPaDTPI(baseframework):
             object_roles=batch.task_object_roles,
             object_presence_mask=batch.object_presence_mask,
             P_ref=P_ref,
+            # Reuse visual tokens from extract_patch_features (Phase 1).
+            precomputed_image_embeds=patch_features.get("_raw_visual_tokens"),
         )
         sampled_queries = self._build_vrt_token_sequences(
             final_hidden=sampled_decode.final_hidden,
@@ -255,6 +295,9 @@ class QwenPaDTPI(baseframework):
             P_ref=P_ref,
             teacher_core_patch_ids=teacher.core_patch_ids,
             valid_patch_mask_per_token=teacher.valid_patch_mask_per_token.to(P_ref.device),
+            # Reuse the visual tokens already produced by extract_patch_features to
+            # avoid a redundant ViT forward (Phase 1 in perf optimization plan).
+            precomputed_image_embeds=patch_features.get("_raw_visual_tokens"),
         )
         grouped = self._build_vrt_token_sequences(
             final_hidden=dynamic_outputs.final_hidden,
@@ -334,6 +377,8 @@ class QwenPaDTPI(baseframework):
             object_roles=batch.task_object_roles,
             object_presence_mask=batch.object_presence_mask.to(P_ref.device),
             P_ref=P_ref,
+            # Reuse visual tokens from extract_patch_features (Phase 1).
+            precomputed_image_embeds=patch_features.get("_raw_visual_tokens"),
         )
         grouped = self._build_vrt_token_sequences(
             final_hidden=decoded.final_hidden,

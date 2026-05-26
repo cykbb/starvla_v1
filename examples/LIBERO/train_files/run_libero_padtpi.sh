@@ -2,7 +2,7 @@
 #SBATCH -J libero_train          # 作业名
 #SBATCH -p testqueue              # 队列/partition
 #SBATCH -A aicloud-testgroup          # 项目号/Account
-#SBATCH -t 0-18                  # 运行时间：0-24 = 24小时
+#SBATCH -t 0-1                  # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
 #SBATCH --gres=gpu:4              # 申请 4 张 GPU
 #SBATCH --signal=B:USR1@600        # 超时前 10 分钟通知 batch shell 保存 checkpoint
@@ -99,7 +99,7 @@ accelerate launch \
   --framework.qwenvl.base_vlm "${base_vlm}" \
   --datasets.vla_data.data_root_dir "${libero_data_root}" \
   --datasets.vla_data.data_mix "${data_mix}" \
-  --datasets.vla_data.per_device_batch_size 6 \
+  --datasets.vla_data.per_device_batch_size 12 \
   --datasets.vla_data.video_backend torchvision_av \
   --datasets.vla_data.padt_use_segmentation_source true \
   --datasets.vla_data.padt_task_meta_required true \

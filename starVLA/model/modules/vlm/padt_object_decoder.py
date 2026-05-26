@@ -9,6 +9,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
 
 
 def _xyxy_to_cxcywh(boxes: torch.Tensor) -> torch.Tensor:
@@ -143,6 +144,11 @@ class PaDTObjectDecoder(nn.Module):
                 self.num_patch_tokens_per_view * self.spatial_merge_size * self.spatial_merge_size,
             )
         )
+
+        # Phase 4: optional gradient checkpointing flag. Toggled by QwenPaDTPI
+        # from trainer.enable_gradient_checkpointing. Inference paths run with
+        # self.training=False so the wrapping is a no-op there.
+        self._use_grad_ckpt = False
 
         self.view_embedding = nn.Embedding(self.num_views, hidden_dim)
         self.vrt_embedding = nn.Embedding(1, hidden_dim)
@@ -350,13 +356,29 @@ class PaDTObjectDecoder(nn.Module):
         low = low_by_view[batch_ids, view_ids]
         high = high_by_view[batch_ids, view_ids]
 
-        query, low = self.low_res_block(query, low)
+        # Phase 4: wrap the 3 cross-attention blocks + mask upscaling in gradient
+        # checkpoint when training. The 3 _PaDTStyleBlock activations are the
+        # biggest single source of decoder activation memory (~600 MB at B=6 in
+        # the current 2048-hidden config); _decode_high_res_masks produces a
+        # 64x64x(D/16) tensor which adds another ~100 MB. After Phase 6 drops
+        # decoder to 1280 hidden, this becomes much smaller — toggle off then if
+        # the activation budget allows.
+        use_ckpt = self._use_grad_ckpt and self.training
+
+        if use_ckpt:
+            query, low = _ckpt.checkpoint(self.low_res_block, query, low, use_reentrant=False)
+        else:
+            query, low = self.low_res_block(query, low)
         high_repeat = max(1, self.high_res_tokens_per_view // self.num_patch_tokens_per_view)
         high = self.high_res_norm(
             high + low.repeat_interleave(high_repeat, dim=1)[:, : self.high_res_tokens_per_view]
         )
-        query, high = self.high_res_block1(query, high)
-        query, high = self.high_res_block2(query, high)
+        if use_ckpt:
+            query, high = _ckpt.checkpoint(self.high_res_block1, query, high, use_reentrant=False)
+            query, high = _ckpt.checkpoint(self.high_res_block2, query, high, use_reentrant=False)
+        else:
+            query, high = self.high_res_block1(query, high)
+            query, high = self.high_res_block2(query, high)
 
         query = query.view(B, O, V, L, D)
         high = high.view(B, O, V, self.high_res_tokens_per_view, D)
@@ -368,7 +390,12 @@ class PaDTObjectDecoder(nn.Module):
         bbox_by_view = _cxcywh_to_xyxy(bbox_cxcywh).clamp(0.0, 1.0)
         score_logits_by_view = self.score_head(score_token).squeeze(-1)
         visibility_logits = score_logits_by_view
-        high_res_mask = self._decode_high_res_masks(mask_token, high)
+        if use_ckpt:
+            high_res_mask = _ckpt.checkpoint(
+                self._decode_high_res_masks, mask_token, high, use_reentrant=False
+            )
+        else:
+            high_res_mask = self._decode_high_res_masks(mask_token, high)
         patch_mask_by_view = self._downsample_masks_to_low_res(high_res_mask)
 
         if target_visible_by_view is not None:
